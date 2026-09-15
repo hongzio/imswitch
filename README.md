@@ -33,10 +33,11 @@ server; `imswitch remote` is the pty proxy; every other verb is a small CLI
 client. The protocol is newline-delimited text and always answers, so `nc -U`
 is a complete client.
 
-Two channels reach the daemon, and the plugin picks between them on every
-event. On the Mac, the unix socket. Anywhere else, an escape sequence written
-to the terminal, which `imswitch remote` pulls back out. There is no third
-case: no tunnel, no listener, no port.
+Two kinds of channel reach the daemon, decided on every event. On the Mac, the
+unix socket. Anywhere else, an escape sequence written into the terminal stream,
+which `imswitch remote` pulls back out — to nvim's own terminal, and to the
+session's tty when a multiplexer would otherwise eat it. No tunnel, no listener,
+no port.
 
 The plugin never reverts to Hangul — switching back is yours to do, the way you
 always have (F17). IMEs with sub-modes do not restore reliably, so imswitch
@@ -85,6 +86,7 @@ vim.pack.add({ { src = 'https://github.com/hongzio/imswitch' } })
 ```lua
 require('imswitch').setup({
   socket = '~/.local/state/imswitch/imswitch.sock',
+  tty_hints = '~/.local/state/imswitch/tty.d',
   throttle_ms = 150,
   connect_timeout_ms = 1000,
   events = { 'FocusGained', 'InsertLeave', 'CmdlineEnter' },
@@ -96,9 +98,13 @@ the only part of the plugin that ever talks to you.
 
 Behaviour worth knowing:
 
-- **The channel is decided per event, and nothing is cached.** The plugin stats
-  the socket; if it is there the daemon is local, so it writes to it. If it is
-  not, it writes the escape sequence to its own terminal. A stat costs
+- **The channels are decided per event, and nothing is cached.** The plugin
+  stats the socket; if it is there the daemon is local, so it writes to it. If
+  it is not, it writes the escape sequence to its own terminal *and* to every
+  session tty listed in the hint directory. Both are a few syscalls whether or
+  not anything is listening, so there is nothing to gain by working out which
+  applies — and nothing to lose when both arrive, because switching is
+  idempotent and the proxy collapses repeats inside 100 ms. A stat costs
   microseconds, and deciding again every time is what lets a three-day-old nvim
   inside tmux pick up an `imswitch remote` that only started this morning.
   There is no endpoint cache, no failure count and no cooldown to go stale.
@@ -168,10 +174,78 @@ Two costs, stated plainly:
 
   `:Imswitch` names the channel it resolved, so "why is this not working" is
   one command away.
-- **tmux needs `set -g allow-passthrough on`.** tmux drops escape sequences it
-  does not know. The plugin wraps the sequence in tmux's DCS form when `$TMUX`
-  is set, but the option still has to be on. Measured both ways: without it the
-  sequence is dropped, with it plus the wrapper it arrives.
+- **A multiplexer in between needs three lines of shell.** tmux, herdr and
+  screen drop sequences they do not recognise. See the next section.
+
+### Multiplexers
+
+tmux, herdr and screen are terminal emulators. They parse a pane's bytes into a
+grid and re-render that grid for the client, so a sequence that owns no cell has
+nowhere to live and is dropped. tmux admits this by gating forwarding behind
+`set -g allow-passthrough on`; herdr (0.9.0) has no equivalent setting and drops
+it outright.
+
+Going *under* the multiplexer rather than through it costs three lines in the
+remote box's shell rc. The session records its own tty on login and removes it
+on exit:
+
+```sh
+if [ -t 0 ] && [ -z "$TMUX" ] && [ -z "$HERDR_PANE_ID" ] && [ -z "$STY" ]; then
+  d=${XDG_STATE_HOME:-$HOME/.local/state}/imswitch/tty.d
+  f=$d/$(tty | tr / _)
+  if mkdir -p "$d" && [ ! -e "$f" ]; then
+    tty > "$f" && trap 'rm -f "$f"' EXIT
+  fi
+fi
+```
+
+Four details in there are load-bearing:
+
+- **`-t 0`, not `-t 1`.** `tty(1)` reports the terminal on *standard input*.
+- **No `$SSH_TTY` test.** It fails from two directions, and both were measured
+  here. It is an OpenSSH convention that other servers need not follow:
+  tailcat's built-in SSH server allocates a pty perfectly well and leaves
+  `SSH_TTY` empty, while filling `SSH_CONNECTION` with a placeholder — a client
+  port of `0` gives it away, since a real TCP connection cannot have one. And
+  multiplexers drop the variable on purpose: tmux's default
+  `update-environment` carries `SSH_CONNECTION` and omits `SSH_TTY`, because a
+  pane's tty is not the session's — the same fact that makes this hint file
+  necessary at all. These lines run in both places, so they cannot lean on it.
+- **Multiplexer panes are excluded** (`$TMUX`, `$HERDR_PANE_ID`, `$STY`). A
+  pane's tty leads back *into* the multiplexer, which is the thing being gone
+  under; recording it would add a channel that silently goes nowhere and a
+  reassuring count in `:Imswitch`.
+- **Named by tty, and written only when absent.** `.bashrc` runs for every
+  interactive shell, so keying on `$$` files one entry per nested shell — all
+  pointing at the same terminal — and the first of them to exit takes the entry
+  away from the ones still running. Keyed by tty there is exactly one entry per
+  terminal, the shell that created it owns the cleanup, and a stale entry left
+  by a hard kill is *correct again* the moment that pts number is reused.
+
+Non-interactive shells never reach this: a script, a `bash -c`, or an
+`ssh host command` does not source `.bashrc` (the stock one returns early, above
+these lines).
+
+The plugin writes the sequence to every tty listed there, on top of writing to
+its own terminal. The multiplexer is only one program in that session; the
+session's pty is a device file, and any process of the same user can open it.
+The bytes reach `imswitch remote` having never touched the grid, which is why
+this also removes the need for `allow-passthrough` under tmux.
+
+A file rather than `$SSH_TTY`, because a pane inherits its environment from the
+multiplexer *server* — a daemon started by whichever session came first, so
+inside a pane that variable can be days stale. The directory is re-read on every
+event instead, which also means several attached Macs each get the switch.
+
+Two things worth knowing. The write can land in the middle of a frame the
+multiplexer is drawing; that costs a transient glitch which the next redraw
+repairs. And a session killed hard leaves its hint behind — if that pts number
+is later recycled, one stray switch reaches a terminal of yours that did not ask
+for it. The exit trap is what keeps that from happening.
+
+Containers are out of scope here: a container's pts namespace is its own, so the
+session tty is not visible inside it. The terminal sequence stays the channel
+there.
 
 The sequence is APC rather than OSC because 777 and 1337 already belong to
 urxvt and iTerm2, and one that reaches a real terminal instead of the proxy has
@@ -239,8 +313,11 @@ reaching you.
   `imswitch remote --` prefix: without the proxy the sequence reaches your real
   terminal, which ignores it. Run `:Imswitch` — it names the channel it
   resolved.
-- **Nothing happens inside tmux.** `set -g allow-passthrough on`. tmux drops
-  escape sequences it does not recognise, wrapper or not.
+- **Nothing happens inside tmux, herdr or screen.** The multiplexer is eating
+  the sequence. Add the three rc lines from the Remote section; under tmux,
+  `set -g allow-passthrough on` also works. To tell them apart, run
+  `printf '\033_imswitch;switch\033\\'` in a pane and then in a shell outside
+  the multiplexer — if only the second one switches, that is this.
 - **Logs grow fast.** `CmdlineEnter` fires on `:`, `/`, `?` and on plugin
   `input()`/`confirm()` calls. Requests are not logged for that reason; if the
   file still grows, warnings are the thing to read.
@@ -316,8 +393,9 @@ Two things about the tap repo itself:
   imswitch`. Nothing is appended to `~/.ssh/config` any more; there is no ssh
   config to keep idempotent.
 - `zsh/` — the `ssh()` wrapper from the Remote section, and whichever of
-  `docker`/`orb`/`tailcat` are worth the same treatment.
-- `tmux.conf` — `set -g allow-passthrough on`.
+  `docker`/`orb`/`tailcat` are worth the same treatment. On any box reached over
+  ssh, also the three tty-hint lines from the Multiplexers section; they are
+  what make a pane inside herdr or tmux work.
 - delete the empty `scripts/imswitch/` directory.
 
 ## License

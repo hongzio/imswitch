@@ -1,15 +1,23 @@
 --- imswitch — force the macOS input source back to the configured target
 --- whenever Neovim moves into command input.
 ---
---- Two channels, and the right one is decided per event:
+--- Three channels, and which ones apply is decided per event:
 ---
 ---   * the daemon's unix socket, when nvim runs on the Mac itself;
----   * an escape sequence written to the terminal, when it does not. It rides
----     the stream that is already there, back to an `imswitch remote --` on the
----     Mac, which strips it and asks the daemon. Nothing is tunnelled, nothing
----     listens, and nothing is installed at the far end — so a container, a
----     tailcat host and three ssh hops all work the same way, and so does a
----     `--network none` container with no shell worth speaking of.
+---   * an escape sequence written to nvim's own terminal, when it does not. It
+---     rides the stream that is already there, back to an `imswitch remote --`
+---     on the Mac, which strips it and asks the daemon. Nothing is tunnelled,
+---     nothing listens, and nothing is installed at the far end — so a
+---     container, a tailcat host and three ssh hops all work the same way, and
+---     so does a `--network none` container with no shell worth speaking of;
+---   * the same sequence written *directly to the session's tty*, for when a
+---     multiplexer sits in between. tmux, herdr and screen are terminal
+---     emulators: they parse a pane's bytes into a grid and re-render it, and a
+---     sequence that owns no cell has nowhere to live, so it is dropped. But
+---     the multiplexer is only one program in that session — the session's own
+---     pty is a device file any process of the same user can open. Writing
+---     there goes under the multiplexer rather than through it. See the README
+---     for the three lines of shell that record the path.
 ---
 --- Nothing is remembered between events. The channel is resolved from what is
 --- true right now, which is what lets a three-day-old nvim inside tmux pick up
@@ -23,6 +31,7 @@ local M = {}
 --- without loading this module. Change both, or override via setup().
 M.config = {
   socket = nil, -- defaults to ~/.local/state/imswitch/imswitch.sock
+  tty_hints = nil, -- defaults to ~/.local/state/imswitch/tty.d
   throttle_ms = 150,
   connect_timeout_ms = 1000,
   events = { 'FocusGained', 'InsertLeave', 'CmdlineEnter' },
@@ -49,9 +58,64 @@ local function home()
   return uv.os_homedir() or vim.env.HOME or ''
 end
 
+local function state_dir()
+  local base = vim.env.XDG_STATE_HOME
+  if base == nil or base == '' then base = home() .. '/.local/state' end
+  return base .. '/imswitch'
+end
+
 local function socket_path()
   local path = M.config.socket or (home() .. '/.local/state/imswitch/imswitch.sock')
   return (path:gsub('^~', function() return home() end))
+end
+
+--- Each file in the hint directory holds the path of one live session's tty.
+--- A session writes its own on login and removes it on exit, so the set is
+--- "terminals currently attached to this box" — which, when more than one Mac
+--- is connected, is exactly the set that should hear about a switch.
+local function tty_hints()
+  local dir = M.config.tty_hints or (state_dir() .. '/tty.d')
+  local request = uv.fs_scandir(dir)
+  if not request then return {} end
+
+  local paths = {}
+  while true do
+    local name, kind = uv.fs_scandir_next(request)
+    if not name then break end
+    if kind ~= 'directory' then paths[#paths + 1] = dir .. '/' .. name end
+  end
+  return paths
+end
+
+--- @return integer how many session ttys accepted the write
+local function send_to_ttys()
+  local sent = 0
+  for _, hint in ipairs(tty_hints()) do
+    local fd = uv.fs_open(hint, 'r', 384)
+    if fd then
+      local body = uv.fs_read(fd, 256, 0)
+      uv.fs_close(fd)
+      -- Absolute paths only. The directory is 0700 and ours, but a truncated or
+      -- half-written hint should fail closed rather than open something else.
+      local path = body and body:match('^%s*(/[^%s]+)')
+      if path then
+        local flags = uv.constants.O_WRONLY + uv.constants.O_NONBLOCK
+          + uv.constants.O_NOCTTY
+        -- O_NOCTTY: this must never become nvim's controlling terminal.
+        -- O_NONBLOCK: a tty whose reader has stopped draining must not wedge
+        -- the editor, and a session that has gone away fails here immediately.
+        local tty = uv.fs_open(path, flags, 384)
+        if tty then
+          if uv.fs_write(tty, SEQUENCE) then sent = sent + 1 end
+          uv.fs_close(tty)
+        end
+        -- A hint that cannot be opened is left alone. Unlinking it would turn
+        -- one transient error into a channel that stays dead until the next
+        -- login, and the session's own exit trap already cleans up.
+      end
+    end
+  end
+  return sent
 end
 
 --- Resolved on every event, not cached: the daemon may start after nvim did,
@@ -64,11 +128,10 @@ local function resolve()
   end
 
   local tmux = vim.env.TMUX ~= nil and vim.env.TMUX ~= ''
-  return {
-    kind = 'sequence',
-    tmux = tmux,
-    label = tmux and 'terminal sequence (tmux-wrapped)' or 'terminal sequence',
-  }
+  local hints = #tty_hints()
+  local label = tmux and 'terminal sequence (tmux-wrapped)' or 'terminal sequence'
+  if hints > 0 then label = label .. (' + %d session tty'):format(hints) end
+  return { kind = 'sequence', tmux = tmux, label = label }
 end
 
 --- One connection per event. The payload is a few bytes at human speed, and a
@@ -156,10 +219,15 @@ function M.fire(opts)
       if opts.on_result then opts.on_result(ok, err, endpoint) end
     end)
   else
-    -- Fire and forget: the bytes leave through the UI and whether anything is
-    -- listening upstream is not knowable from here, which is the same silence
-    -- the socket path keeps when no daemon is running.
+    -- Both, unconditionally. Each costs a few syscalls whether or not anything
+    -- is listening, so there is nothing to gain by working out which one
+    -- applies — and nothing to lose if both arrive, because the daemon's switch
+    -- is idempotent and the proxy collapses repeats inside 100 ms.
+    send_to_ttys()
     send_sequence(endpoint.tmux)
+    -- Fire and forget: the bytes leave through a one-way channel and whether
+    -- anything is listening upstream is not knowable from here, which is the
+    -- same silence the socket path keeps when no daemon is running.
     if opts.on_result then opts.on_result(true, nil, endpoint) end
   end
   return true
