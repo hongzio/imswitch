@@ -9,7 +9,8 @@ let usage = """
 
     usage: imswitch <command>
 
-      serve         menu bar app + unix socket server (what brew services runs)
+      serve         menu bar app + unix socket server (what brew services runs,
+                    and what a Finder/`open` launch runs with no arguments)
       switch        switch to the configured target; no-op if already there
       get           print the current input source ID
       ping          liveness check
@@ -20,7 +21,9 @@ let usage = """
 
 let arguments = CommandLine.arguments
 
-switch arguments.count > 1 ? arguments[1] : "" {
+// No verb means the bundle was launched as an app — by Finder, by `open`, or
+// by a LaunchAgent that omits the argument. Serve.
+switch arguments.count > 1 ? arguments[1] : "serve" {
 case "serve":
     Daemon.run()
 
@@ -34,10 +37,6 @@ case "ssh-config":
 case "-h", "--help", "help":
     print(usage)
     exit(0)
-
-case "":
-    FileHandle.standardError.write(Data((usage + "\n").utf8))
-    exit(2)
 
 default:
     FileHandle.standardError.write(Data("imswitch: unknown command '\(arguments[1])'\n\n".utf8))

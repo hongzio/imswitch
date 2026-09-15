@@ -56,6 +56,9 @@ require that session — do not hand-write the plist.
 open build/Imswitch.app
 ```
 
+Launching the bundle with no arguments — from Finder, from `open`, or from a
+LaunchAgent that omits it — is the same as `imswitch serve`.
+
 Requires only the Command Line Tools: `Carbon.framework`, `TextInputSources.h`
 and the Swift module map all ship there, so no full Xcode install is needed.
 
@@ -148,7 +151,7 @@ Three things about this block are load-bearing:
 
 | command | what it does | reply |
 |---|---|---|
-| `imswitch serve` | menu bar app + socket server | — |
+| `imswitch serve` | menu bar app + socket server (also the no-argument default) | — |
 | `imswitch switch` | switch to the configured target; no-op if already there | `ok switched` / `ok noop` / `ok disabled` / `err ...` |
 | `imswitch get` | current input source ID | `ok <source-id>` |
 | `imswitch ping` | liveness check | `pong` |
