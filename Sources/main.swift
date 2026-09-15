@@ -15,6 +15,8 @@ let usage = """
       get           print the current input source ID
       ping          liveness check
       ssh-config    print the ssh_config snippet for the reverse tunnel
+      remote -- CMD run CMD behind a pty, so a Neovim inside it can reach this
+                    Mac with no tunnel (docker exec, orb, tailcat ssh, ...)
 
     socket: \(SocketPath.default)
     """
@@ -29,6 +31,14 @@ case "serve":
 
 case "switch", "get", "ping":
     exit(Client.run(arguments[1]))
+
+case "remote":
+    // Everything after the verb is the user's command, verbatim. A leading
+    // `--` is accepted and dropped so that flags meant for that command are
+    // never mistaken for imswitch's own.
+    var rest = Array(arguments.dropFirst(2))
+    if rest.first == "--" { rest.removeFirst() }
+    Remote.run(rest)
 
 case "ssh-config":
     print(SSHConfig.snippet)

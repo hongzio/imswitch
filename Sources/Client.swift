@@ -4,10 +4,29 @@ import Foundation
 enum Client {
     /// Exit status: 0 when the daemon answered `ok`/`pong`, 1 otherwise.
     static func run(_ command: String, path: String = SocketPath.default) -> Int32 {
+        guard let reply = send(command, path: path, quiet: false) else { return 1 }
+        print(reply)
+        return (reply == "pong" || reply.hasPrefix("ok")) ? 0 : 1
+    }
+
+    /// One line in, one line out; nil when the daemon could not be reached.
+    ///
+    /// `quiet` is for callers that own the user's terminal. `imswitch remote`
+    /// proxies a pty, so a diagnostic on stderr would land in the middle of
+    /// whatever the user is looking at.
+    @discardableResult
+    static func send(
+        _ command: String, path: String = SocketPath.default, quiet: Bool = true
+    ) -> String? {
+        func complain(_ message: String) {
+            guard !quiet else { return }
+            FileHandle.standardError.write(Data(message.utf8))
+        }
+
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
-            FileHandle.standardError.write(Data("imswitch: socket: \(String(cString: strerror(errno)))\n".utf8))
-            return 1
+            complain("imswitch: socket: \(String(cString: strerror(errno)))\n")
+            return nil
         }
         defer { close(fd) }
 
@@ -15,8 +34,8 @@ enum Client {
         let capacity = MemoryLayout.size(ofValue: addr.sun_path)
         let bytes = Array(path.utf8)
         guard bytes.count < capacity else {
-            FileHandle.standardError.write(Data("imswitch: socket path too long: \(path)\n".utf8))
-            return 1
+            complain("imswitch: socket path too long: \(path)\n")
+            return nil
         }
         addr.sun_family = sa_family_t(AF_UNIX)
         addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
@@ -38,10 +57,10 @@ enum Client {
         }
         guard connected == 0 else {
             let why = String(cString: strerror(errno))
-            FileHandle.standardError.write(Data((
+            complain(
                 "imswitch: cannot reach the daemon at \(path) (\(why))\n"
-                + "imswitch: is it running?  brew services start imswitch\n").utf8))
-            return 1
+                    + "imswitch: is it running?  brew services start imswitch\n")
+            return nil
         }
 
         let request = Array((command + "\n").utf8)
@@ -52,8 +71,8 @@ enum Client {
             }
             if n <= 0 {
                 if n < 0 && errno == EINTR { continue }
-                FileHandle.standardError.write(Data("imswitch: write failed\n".utf8))
-                return 1
+                complain("imswitch: write failed\n")
+                return nil
             }
             offset += n
         }
@@ -74,8 +93,6 @@ enum Client {
             reply.append(contentsOf: chunk[0..<n])
         }
 
-        let text = String(decoding: reply, as: UTF8.self)
-        print(text)
-        return (text == "pong" || text.hasPrefix("ok")) ? 0 : 1
+        return String(decoding: reply, as: UTF8.self)
     }
 }
