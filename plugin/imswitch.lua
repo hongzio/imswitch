@@ -17,4 +17,4 @@ vim.api.nvim_create_autocmd({ 'FocusGained', 'InsertLeave', 'CmdlineEnter' }, {
 
 vim.api.nvim_create_user_command('Imswitch', function()
   require('imswitch').command()
-end, { desc = 'imswitch: clear the cooldown, force a switch, report the endpoint' })
+end, { desc = 'imswitch: force a switch and report the channel it resolved' })

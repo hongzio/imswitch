@@ -5,7 +5,7 @@ import Foundation
 signal(SIGPIPE, SIG_IGN)
 
 let usage = """
-    imswitch — force the macOS input source from Neovim, locally or over SSH
+    imswitch — force the macOS input source from Neovim, locally or anywhere
 
     usage: imswitch <command>
 
@@ -14,7 +14,6 @@ let usage = """
       switch        switch to the configured target; no-op if already there
       get           print the current input source ID
       ping          liveness check
-      ssh-config    print the ssh_config snippet for the reverse tunnel
       remote -- CMD run CMD behind a pty, so a Neovim inside it can reach this
                     Mac with no tunnel (docker exec, orb, tailcat ssh, ...)
 
@@ -39,10 +38,6 @@ case "remote":
     var rest = Array(arguments.dropFirst(2))
     if rest.first == "--" { rest.removeFirst() }
     Remote.run(rest)
-
-case "ssh-config":
-    print(SSHConfig.snippet)
-    exit(0)
 
 case "-h", "--help", "help":
     print(usage)

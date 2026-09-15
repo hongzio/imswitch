@@ -60,17 +60,17 @@ final class SocketServer {
     private let connectionQueue = DispatchQueue(
         label: "com.hongzio.imswitch.connection", attributes: .concurrent)
     /// Bounds how many connections can be in flight. Without it, anything that
-    /// can reach the socket — including whatever shares a host at the far end of
-    /// an ssh RemoteForward — can open connections faster than they retire and
-    /// starve every real request until it stops.
+    /// can reach the socket — every process running as this user, plus whatever
+    /// an `imswitch remote` proxy relays in — can open connections faster than
+    /// they retire and starve every real request until it stops.
     private static let maxConcurrentConnections = 16
     private let connectionSlots = DispatchSemaphore(value: maxConcurrentConnections)
     /// Wall-clock budget for one request. SO_RCVTIMEO is a *per-read* timeout
     /// that every byte resets, so a client dripping one byte at a time could
-    /// otherwise hold a slot for hours. A real client — local or across an ssh
-    /// tunnel — sends its whole line in one write, so this only ever bites
-    /// misbehaving ones, and keeping it short is what makes slots turn over
-    /// during a flood.
+    /// otherwise hold a slot for hours. A real client — nvim on this Mac, or an
+    /// `imswitch remote` relaying for one that is not — sends its whole line in
+    /// one write, so this only ever bites misbehaving ones, and keeping it
+    /// short is what makes slots turn over during a flood.
     private static let connectionDeadline: TimeInterval = 2
 
     init(path: String = SocketPath.default, handler: @escaping Handler) {

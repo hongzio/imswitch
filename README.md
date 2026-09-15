@@ -1,7 +1,8 @@
 # imswitch
 
 Force the macOS input source back to ASCII the moment Neovim expects command
-keys — from a local terminal, from an SSH session, or from inside a container.
+keys — from a local terminal, from an ssh session, from inside a container,
+from anywhere you can get a shell.
 
 Leave a Hangul IME on, return to vim, and every normal-mode key is gone:
 `hjkl` arrives as `ㅗㅓㅏㅣ`. The fix is to tie three Neovim events —
@@ -19,13 +20,23 @@ Imswitch.app (LSUIElement, menu bar)        ← managed by brew services
 ├── NSStatusItem ─ pick the target input source / enable / status
 └── unix socket ─ ~/.local/state/imswitch/imswitch.sock
          ▲                          ▲
-         │ local nvim               │ remote nvim over an ssh -R tunnel
-                                    (127.0.0.1:57377 on the remote side)
+         │ local nvim               │ imswitch remote -- <anything>
+                                    │   a pty in the middle of your terminal,
+                                    │   stripping one escape sequence out of
+                                    │   the stream that is already there
+                                    └── remote nvim, in whatever that command
+                                        got you into
 ```
 
-One binary, two roles. `imswitch serve` is the menu bar app *and* the socket
-server; every other verb is a small CLI client that talks to it. The protocol
-is newline-delimited text and always answers, so `nc -U` is a complete client.
+One binary, three roles. `imswitch serve` is the menu bar app *and* the socket
+server; `imswitch remote` is the pty proxy; every other verb is a small CLI
+client. The protocol is newline-delimited text and always answers, so `nc -U`
+is a complete client.
+
+Two channels reach the daemon, and the plugin picks between them on every
+event. On the Mac, the unix socket. Anywhere else, an escape sequence written
+to the terminal, which `imswitch remote` pulls back out. There is no third
+case: no tunnel, no listener, no port.
 
 The plugin never reverts to Hangul — switching back is yours to do, the way you
 always have (F17). IMEs with sub-modes do not restore reliably, so imswitch
@@ -74,114 +85,102 @@ vim.pack.add({ { src = 'https://github.com/hongzio/imswitch' } })
 ```lua
 require('imswitch').setup({
   socket = '~/.local/state/imswitch/imswitch.sock',
-  host = '127.0.0.1',
-  port = 57377,
   throttle_ms = 150,
   connect_timeout_ms = 1000,
-  failure_threshold = 3,
-  cooldown_ms = 60 * 1000,
   events = { 'FocusGained', 'InsertLeave', 'CmdlineEnter' },
 })
 ```
 
-`$IMSWITCH_ADDR` overrides the endpoint for one session: `host:port` is TCP,
-anything else is a socket path. The TCP form is accepted for loopback only —
-the override exists to reach an `ssh -R` tunnel, and a non-loopback address
-would turn every `:` into a packet announcing to whoever set the variable that
-you are at your editor.
-
-`:Imswitch` clears the cooldown, forces a request through, and reports the
-endpoint it resolved. It is the only part of the plugin that ever talks to
-you.
+`:Imswitch` forces a request through and reports the channel it resolved. It is
+the only part of the plugin that ever talks to you.
 
 Behaviour worth knowing:
 
-- **Endpoint resolution is lazy.** Nothing happens at startup. On the first
-  event the plugin stats the local socket; if it is there, it uses it,
-  otherwise it falls through to TCP `127.0.0.1:57377` — which is where the
-  `ssh -R` tunnel lands on a remote box.
+- **The channel is decided per event, and nothing is cached.** The plugin stats
+  the socket; if it is there the daemon is local, so it writes to it. If it is
+  not, it writes the escape sequence to its own terminal. A stat costs
+  microseconds, and deciding again every time is what lets a three-day-old nvim
+  inside tmux pick up an `imswitch remote` that only started this morning.
+  There is no endpoint cache, no failure count and no cooldown to go stale.
 - **Leading-edge throttle, not a trailing debounce.** Right after `:` the
   *next* keystroke already has to be ASCII, so the request goes out
   immediately and repeats inside the 150 ms window are dropped. Every request
   converges on the same state, so queueing would buy nothing.
-- **A fresh connection per event.** The payload is seven bytes at human speed,
-  and a persistent connection over an `ssh` RemoteForward dies silently with
-  the tunnel. Reconnecting turns a dead tunnel into one failed `connect()`.
+- **A fresh connection per event on the socket channel.** The payload is seven
+  bytes at human speed, and a socket that has gone away should surface as one
+  failed `connect()` rather than a handle held open across events.
 - **`FocusGained` is skipped while composing prose** (insert, replace,
   terminal, select). Coming back from another app mid-syllable must not steal
   the composition. `InsertLeave` and `CmdlineEnter` *are* the move into
   command input, so they always fire.
-- **Silent when there is nothing to talk to.** Three consecutive failures buy
-  a 60-second cooldown, and the endpoint cache is dropped so the daemon can
-  come back as the other kind. No messages, no lag, and recovery needs no
-  restart.
+- **Silent when there is nothing to talk to.** A failed connect says nothing
+  and costs nothing. The sequence channel cannot be acknowledged at all, so
+  `:Imswitch` reports `sent (no reply on this channel)` rather than claiming an
+  arrival it cannot know about.
 
-## SSH
+## Remote
+
+Anywhere that is not this Mac — a container, an OrbStack machine, a host behind
+tailcat, three ssh hops — run the thing you were going to run anyway with
+`imswitch remote --` in front of it:
 
 ```sh
-imswitch ssh-config >> ~/.ssh/config
+imswitch remote -- ssh nas
+imswitch remote -- docker exec -it devbox /bin/zsh
+imswitch remote -- orb -m ubuntu
+imswitch remote -- tailcat ssh tcXXXXXXXXX
+imswitch remote -- kubectl exec -it pod/foo -- bash
 ```
 
-**Know what this grants before you keep it.** After appending the block, every
-host you SSH into gets a loopback listener that tunnels to the daemon on your
-Mac, and *any local user on that host* can drive it — force your input source,
-or poll `get` to tell when you are at the keyboard. It also turns SSH connection
-sharing on globally. On a machine where you only reach hosts you control, that
-is a fine trade. On one where you SSH into shared or untrusted boxes, narrow
-`Host *` to an explicit list, or skip the block and use imswitch locally only.
+imswitch puts a pty between your terminal and that command and copies bytes
+both ways. It reads nothing and changes nothing, and removes exactly one thing:
+`ESC _ imswitch;switch ESC \`, which the plugin writes to its own terminal when
+it wants a switch. It rides the stream that is already there. This is the same
+door Neovim's own OSC 52 clipboard uses to reach a Mac from a remote host.
 
-```sshconfig
-# ControlMaster is first-value-wins, so this block has to stay above Host *.
-# It matches literal names only, not aliases.
-Host github.com gitlab.com ssh.github.com bitbucket.org codeberg.org git.sr.ht ssh.dev.azure.com
-    ControlMaster no
+Five things follow, and together they are the reason for this design:
 
-Host *
-    RemoteForward 127.0.0.1:57377 %d/.local/state/imswitch/imswitch.sock
-    ExitOnForwardFailure no
-    ServerAliveInterval 30
-    ServerAliveCountMax 3
-    ControlMaster auto
-    ControlPath ~/.ssh/cm-%C
-    ControlPersist 30
+- **The command is never parsed.** `remote` does not know what `docker` or
+  `tailcat` are, and does not need to. Whatever you typed, runs.
+- **Nothing is installed at the far end.** No listener, no tunnel, no file, no
+  shell worth speaking of. A `--network none` container with a read-only rootfs
+  works; so does a serial console.
+- **Nesting is free.** `imswitch remote -- ssh a`, then `docker exec` from
+  inside that: the sequence rides up through every hop.
+- **It cannot be turned around to read you.** The channel is one-way, so
+  nothing at the far end can poll whether you are at the keyboard. The `ssh -R`
+  tunnel this replaces could.
+- **Reaching it means already being in your session.** Writing to your terminal
+  is the entire requirement, and anything that can do that is past every fence
+  that matters.
 
-Match final host github.com,gitlab.com,ssh.github.com,altssh.gitlab.com,bitbucket.org,codeberg.org,git.sr.ht,ssh.dev.azure.com,vs-ssh.visualstudio.com,git-codecommit.*.amazonaws.com,*.googlesource.com
-    ClearAllForwardings yes
-```
+Without a terminal — in a pipe or a script — `remote` runs the command
+unchanged rather than wrapping it.
 
-Five things about this block are load-bearing. The first three were measured
-with `ssh -G`, because the obvious reading of the ssh_config rules is wrong:
+Two costs, stated plainly:
 
-- **`RemoteForward` accumulates; it is not first-value-wins.** Two matching
-  blocks each contribute a forward and both survive. Ordering therefore never
-  protected the git hosts — `ClearAllForwardings` does, and that keyword is
-  applied after the whole config is parsed, so its block works *below*
-  `Host *`. What ordering is actually required for is `ControlMaster`, which
-  *is* first-value-wins.
-- **`Match final` is what catches aliases.** `Host` patterns match the name you
-  type, not the resolved `HostName`, so a perfectly ordinary
-  `Host gh` / `HostName github.com` slips past a literal `Host github.com`
-  block. `Match final` re-evaluates after substitution and catches it.
-- **The bind address is explicit.** `RemoteForward` with no bind address defers
-  to the remote's `GatewayPorts`, and a server set to `yes` would publish the
-  channel on the wildcard address rather than loopback. You do not control that
-  setting, cannot see it, and `ExitOnForwardFailure no` means you would never
-  be told.
-- **The remote end is TCP, not a unix socket.** `StreamLocalBindUnlink` exists
-  only in the *remote* `sshd_config`. A remote unix socket left behind by an
-  unclean exit would block forwarding for every later session; a TCP port is
-  released when the session ends.
-- **`ControlMaster` is effectively required.** OpenSSH never retries a failed
-  remote forward, so without a shared connection the second session to a host
-  stays tunnel-less forever. Sharing the connection means one tunnel per host
-  and the problem disappears. `ControlPersist` is deliberately short: a master
-  is a *pre-authenticated* channel, and anything running as you can attach to
-  it and skip key passphrases, hardware-key touches, and `ProxyCommand`-based
-  auth entirely. imswitch only needs the master while a session is open, so
-  there is no reason to let it outlive one by minutes.
+- **You have to remember the prefix.** Forget it and nothing happens, silently.
+  A shell function is the usual fix:
 
-Never run `imswitch serve` on a remote host. It would bind a socket there that
-nothing is tunnelled to, and shadow nothing useful.
+  ```sh
+  ssh() { command imswitch remote -- ssh "$@"; }
+  ```
+
+  `:Imswitch` names the channel it resolved, so "why is this not working" is
+  one command away.
+- **tmux needs `set -g allow-passthrough on`.** tmux drops escape sequences it
+  does not know. The plugin wraps the sequence in tmux's DCS form when `$TMUX`
+  is set, but the option still has to be on. Measured both ways: without it the
+  sequence is dropped, with it plus the wrapper it arrives.
+
+The sequence is APC rather than OSC because 777 and 1337 already belong to
+urxvt and iTerm2, and one that reaches a real terminal instead of the proxy has
+to be swallowed in silence rather than drawn.
+
+One consequence worth knowing: the sequence travels in your terminal stream, so
+anything already recording that stream — asciinema, a bastion's `script` log —
+gets a mark every time you press `:`. It leaks presence to something that is
+already recording you, and to nothing else.
 
 ## Commands
 
@@ -191,7 +190,7 @@ nothing is tunnelled to, and shadow nothing useful.
 | `imswitch switch` | switch to the configured target; no-op if already there | `ok switched` / `ok noop` / `ok disabled` / `err ...` |
 | `imswitch get` | current input source ID | `ok <source-id>` |
 | `imswitch ping` | liveness check | `pong` |
-| `imswitch ssh-config` | print the ssh_config snippet | (text) |
+| `imswitch remote -- CMD` | run CMD behind a pty and carry switches out of it | (CMD's own output) |
 
 Switching is idempotent by design. The triggers fire often enough that an
 unconditional `TISSelectInputSource` makes the IME visibly flicker.
@@ -215,7 +214,8 @@ unconditional `TISSelectInputSource` makes the IME visibly flicker.
 The menu is rebuilt every time it opens, so input sources added or removed
 since the last look show up immediately. Palettes (Emoji & Symbols, Press and
 Hold) are filtered out — they report as selectable but are not keyboards.
-"마지막 요청" is the cheapest way to tell whether a remote tunnel is alive.
+"마지막 요청" is the cheapest way to tell whether a remote session is still
+reaching you.
 
 ## Troubleshooting
 
@@ -235,8 +235,12 @@ Hold) are filtered out — they report as selectable but are not keyboards.
   attribute, but if it ever does:
   `xattr -d com.apple.quarantine build/Imswitch.app` — for a bundle you built
   yourself, not as a general habit.
-- **A `docker exec` shell has no tunnel.** It never went through ssh, so the
-  plugin quietly does nothing. OrbStack's `<container>@orb` is ssh and works.
+- **Nothing happens in a remote nvim.** Almost always the missing
+  `imswitch remote --` prefix: without the proxy the sequence reaches your real
+  terminal, which ignores it. Run `:Imswitch` — it names the channel it
+  resolved.
+- **Nothing happens inside tmux.** `set -g allow-passthrough on`. tmux drops
+  escape sequences it does not recognise, wrapper or not.
 - **Logs grow fast.** `CmdlineEnter` fires on `:`, `/`, `?` and on plugin
   `input()`/`confirm()` calls. Requests are not logged for that reason; if the
   file still grows, warnings are the thing to read.
@@ -282,7 +286,9 @@ class Imswitch < Formula
 
   test do
     assert_match "imswitch", shell_output("#{bin}/imswitch --help")
-    assert_match "RemoteForward 57377", shell_output("#{bin}/imswitch ssh-config")
+    # No terminal here, so `remote` runs the command unchanged -- which is
+    # exactly the path a script or a pipeline takes.
+    assert_equal "ok", shell_output("#{bin}/imswitch remote -- /bin/echo ok").strip
   end
 end
 ```
@@ -305,12 +311,13 @@ Two things about the tap repo itself:
   to the `vim.pack.add` list and `require('plugins.imswitch')` to the load order.
 - `nvim/lua/plugins/imswitch.lua` (new) — `require('imswitch').setup({})`;
   `nvim/lua/plugins/virgil.lua` is the model.
-- `init.sh` — two `check_step`/`mark_step` blocks: ① `brew trust hongzio/tap &&
+- `init.sh` — one `check_step`/`mark_step` block: `brew trust hongzio/tap &&
   brew tap hongzio/tap && brew install --HEAD imswitch && brew services start
-  imswitch`; ② `grep -q
-  "imswitch BEGIN" ~/.ssh/config || imswitch ssh-config >> ~/.ssh/config`. The
-  marker grep is the real idempotence guard for the ssh block — `$TMPDIR/checkpoint`
-  does not survive a reboot.
+  imswitch`. Nothing is appended to `~/.ssh/config` any more; there is no ssh
+  config to keep idempotent.
+- `zsh/` — the `ssh()` wrapper from the Remote section, and whichever of
+  `docker`/`orb`/`tailcat` are worth the same treatment.
+- `tmux.conf` — `set -g allow-passthrough on`.
 - delete the empty `scripts/imswitch/` directory.
 
 ## License
