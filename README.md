@@ -40,6 +40,7 @@ or anything else, needs no code change.
 ### Homebrew
 
 ```sh
+brew trust hongzio/tap          # Homebrew 7 refuses to load untrusted third-party taps
 brew tap hongzio/tap
 brew install --HEAD imswitch
 brew services start imswitch
@@ -207,17 +208,26 @@ Hold) are filtered out — they report as selectable but are not keyboards.
 
 Two other repos are needed to make this installable; neither is touched here.
 
-**`hongzio/homebrew-tap`** — one file, `Formula/imswitch.rb`:
+**`hongzio/homebrew-tap`** — one file, `Formula/imswitch.rb`. This was built and
+installed end to end against Homebrew 7.0.1 before being written down here:
+`swiftc` and `codesign` both run fine under Homebrew's superenv and sandbox, and
+the generated LaunchAgent carries `ProcessType Interactive`, `KeepAlive` and an
+`Aqua` session type.
 
 ```ruby
 class Imswitch < Formula
   desc "Force the macOS input source from Neovim, locally or over SSH"
   homepage "https://github.com/hongzio/imswitch"
+  license "MIT"
   head "https://github.com/hongzio/imswitch.git", branch: "main"
   # url/sha256 once v0.1.0 is tagged
 
+  # No Xcode requirement. `depends_on xcode: :clt` is a trap: XcodeRequirement
+  # only parses a version string off its tags, so :clt is ignored and a full
+  # Xcode.app is demanded — the build fails on a Command Line Tools machine with
+  # "A full installation of Xcode.app is required". Homebrew already requires the
+  # CLT, which is all build.sh needs.
   depends_on :macos
-  depends_on xcode: :clt
 
   def install
     system "./build.sh"
@@ -232,8 +242,25 @@ class Imswitch < Formula
     log_path var/"log/imswitch.log"
     error_log_path var/"log/imswitch.log"
   end
+
+  test do
+    assert_match "imswitch", shell_output("#{bin}/imswitch --help")
+    assert_match "RemoteForward 57377", shell_output("#{bin}/imswitch ssh-config")
+  end
 end
 ```
+
+Two things about the tap repo itself:
+
+- **The name must be `homebrew-tap`.** Homebrew 7 requires third-party taps to be
+  trusted, and a tap whose remote is not `https://github.com/<user>/homebrew-<repo>`
+  counts as a *custom remote*, which can only be trusted by full URL
+  (`Tap#matches_reference?`). Folding the formula into this repo does work —
+  `brew tap hongzio/imswitch https://github.com/hongzio/imswitch` plus
+  `brew trust --tap https://github.com/hongzio/imswitch` — but the `homebrew-`
+  name is what keeps `brew trust hongzio/tap` short.
+- **`brew trust` comes before `brew tap`**, otherwise tapping fails with
+  "Cannot tap: invalid syntax in tap!" rather than anything about trust.
 
 **`hongzio/hongzio.github.io`** (dotfiles) — thin wiring only:
 
@@ -241,8 +268,9 @@ end
   to the `vim.pack.add` list and `require('plugins.imswitch')` to the load order.
 - `nvim/lua/plugins/imswitch.lua` (new) — `require('imswitch').setup({})`;
   `nvim/lua/plugins/virgil.lua` is the model.
-- `init.sh` — two `check_step`/`mark_step` blocks: ① `brew tap hongzio/tap &&
-  brew install --HEAD imswitch && brew services start imswitch`; ② `grep -q
+- `init.sh` — two `check_step`/`mark_step` blocks: ① `brew trust hongzio/tap &&
+  brew tap hongzio/tap && brew install --HEAD imswitch && brew services start
+  imswitch`; ② `grep -q
   "imswitch BEGIN" ~/.ssh/config || imswitch ssh-config >> ~/.ssh/config`. The
   marker grep is the real idempotence guard for the ssh block — `$TMPDIR/checkpoint`
   does not survive a reboot.
