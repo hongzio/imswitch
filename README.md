@@ -85,7 +85,10 @@ require('imswitch').setup({
 ```
 
 `$IMSWITCH_ADDR` overrides the endpoint for one session: `host:port` is TCP,
-anything else is a socket path.
+anything else is a socket path. The TCP form is accepted for loopback only —
+the override exists to reach an `ssh -R` tunnel, and a non-loopback address
+would turn every `:` into a packet announcing to whoever set the variable that
+you are at your editor.
 
 `:Imswitch` clears the cooldown, forces a request through, and reports the
 endpoint it resolved. It is the only part of the plugin that ever talks to
@@ -119,25 +122,51 @@ Behaviour worth knowing:
 imswitch ssh-config >> ~/.ssh/config
 ```
 
+**Know what this grants before you keep it.** After appending the block, every
+host you SSH into gets a loopback listener that tunnels to the daemon on your
+Mac, and *any local user on that host* can drive it — force your input source,
+or poll `get` to tell when you are at the keyboard. It also turns SSH connection
+sharing on globally. On a machine where you only reach hosts you control, that
+is a fine trade. On one where you SSH into shared or untrusted boxes, narrow
+`Host *` to an explicit list, or skip the block and use imswitch locally only.
+
 ```sshconfig
-Host github.com gitlab.com ssh.github.com
-    ClearAllForwardings yes
+# ControlMaster is first-value-wins, so this block has to stay above Host *.
+# It matches literal names only, not aliases.
+Host github.com gitlab.com ssh.github.com bitbucket.org codeberg.org git.sr.ht ssh.dev.azure.com
     ControlMaster no
 
 Host *
-    RemoteForward 57377 %d/.local/state/imswitch/imswitch.sock
+    RemoteForward 127.0.0.1:57377 %d/.local/state/imswitch/imswitch.sock
     ExitOnForwardFailure no
     ServerAliveInterval 30
     ServerAliveCountMax 3
     ControlMaster auto
     ControlPath ~/.ssh/cm-%C
-    ControlPersist 10m
+    ControlPersist 30
+
+Match final host github.com,gitlab.com,ssh.github.com,altssh.gitlab.com,bitbucket.org,codeberg.org,git.sr.ht,ssh.dev.azure.com,vs-ssh.visualstudio.com,git-codecommit.*.amazonaws.com,*.googlesource.com
+    ClearAllForwardings yes
 ```
 
-Three things about this block are load-bearing:
+Five things about this block are load-bearing. The first three were measured
+with `ssh -G`, because the obvious reading of the ssh_config rules is wrong:
 
-- **Order.** ssh takes the first value it sees for each keyword, so the
-  exception block has to sit *above* `Host *`.
+- **`RemoteForward` accumulates; it is not first-value-wins.** Two matching
+  blocks each contribute a forward and both survive. Ordering therefore never
+  protected the git hosts — `ClearAllForwardings` does, and that keyword is
+  applied after the whole config is parsed, so its block works *below*
+  `Host *`. What ordering is actually required for is `ControlMaster`, which
+  *is* first-value-wins.
+- **`Match final` is what catches aliases.** `Host` patterns match the name you
+  type, not the resolved `HostName`, so a perfectly ordinary
+  `Host gh` / `HostName github.com` slips past a literal `Host github.com`
+  block. `Match final` re-evaluates after substitution and catches it.
+- **The bind address is explicit.** `RemoteForward` with no bind address defers
+  to the remote's `GatewayPorts`, and a server set to `yes` would publish the
+  channel on the wildcard address rather than loopback. You do not control that
+  setting, cannot see it, and `ExitOnForwardFailure no` means you would never
+  be told.
 - **The remote end is TCP, not a unix socket.** `StreamLocalBindUnlink` exists
   only in the *remote* `sshd_config`. A remote unix socket left behind by an
   unclean exit would block forwarding for every later session; a TCP port is
@@ -145,8 +174,14 @@ Three things about this block are load-bearing:
 - **`ControlMaster` is effectively required.** OpenSSH never retries a failed
   remote forward, so without a shared connection the second session to a host
   stays tunnel-less forever. Sharing the connection means one tunnel per host
-  and the problem disappears. Git hosts are excluded above, since a shared
-  master there is a nuisance.
+  and the problem disappears. `ControlPersist` is deliberately short: a master
+  is a *pre-authenticated* channel, and anything running as you can attach to
+  it and skip key passphrases, hardware-key touches, and `ProxyCommand`-based
+  auth entirely. imswitch only needs the master while a session is open, so
+  there is no reason to let it outlive one by minutes.
+
+Never run `imswitch serve` on a remote host. It would bind a socket there that
+nothing is tunnelled to, and shadow nothing useful.
 
 ## Commands
 
@@ -197,7 +232,9 @@ Hold) are filtered out — they report as selectable but are not keyboards.
   Aqua session. Start it through `brew services`, not from a bare shell over
   SSH.
 - **Gatekeeper blocks the app.** A local build carries no quarantine
-  attribute, but if it ever does: `xattr -d com.apple.quarantine`.
+  attribute, but if it ever does:
+  `xattr -d com.apple.quarantine build/Imswitch.app` — for a bundle you built
+  yourself, not as a general habit.
 - **A `docker exec` shell has no tunnel.** It never went through ssh, so the
   plugin quietly does nothing. OrbStack's `<container>@orb` is ssh and works.
 - **Logs grow fast.** `CmdlineEnter` fires on `:`, `/`, `?` and on plugin

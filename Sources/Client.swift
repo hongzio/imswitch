@@ -58,9 +58,12 @@ enum Client {
             offset += n
         }
 
+        // Bounded for the same reason the daemon bounds the request: whatever is
+        // on the other end of this path may not be the daemon.
+        let replyLimit = 4096
         var reply = [UInt8]()
         var chunk = [UInt8](repeating: 0, count: 256)
-        while true {
+        while reply.count < replyLimit {
             let n = read(fd, &chunk, chunk.count)
             if n < 0 && errno == EINTR { continue }
             if n <= 0 { break }

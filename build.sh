@@ -7,6 +7,15 @@ cd "$(dirname "$0")"
 
 VERSION="${IMSWITCH_VERSION:-0.1.0}"
 APP="build/Imswitch.app"
+
+# The version ends up in Info.plist. Validate it instead of trusting it: it used
+# to be interpolated into a sed program, where a value with escaped slashes could
+# inject arbitrary plist keys — an LSEnvironment/DYLD_INSERT_LIBRARIES pair, say
+# — while leaving CFBundleShortVersionString looking perfectly normal.
+if [[ ! "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+	echo "build.sh: refusing IMSWITCH_VERSION '$VERSION' (allowed: [0-9A-Za-z.+-])" >&2
+	exit 1
+fi
 SDK="$(xcrun --show-sdk-path)"
 
 rm -rf "$APP"
@@ -19,8 +28,16 @@ swiftc -O -sdk "$SDK" \
 	-o "$APP/Contents/MacOS/imswitch" \
 	Sources/*.swift
 
-sed "s/@VERSION@/${VERSION}/g" Info.plist.in > "$APP/Contents/Info.plist"
+# plutil, not sed: -replace -string treats the value as data and escapes it,
+# so the version cannot become markup.
+cp Info.plist.in "$APP/Contents/Info.plist"
+plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
+plutil -replace CFBundleVersion -string "$VERSION" "$APP/Contents/Info.plist"
+plutil -lint "$APP/Contents/Info.plist" > /dev/null
 
-codesign --force --sign - "$APP"
+# --options runtime turns on the hardened runtime, which ignores
+# DYLD_INSERT_LIBRARIES and enforces library validation. Ad-hoc signing gives no
+# authenticity, but this at least removes dylib injection as a way in.
+codesign --force --options runtime --sign - "$APP"
 
 echo "built $APP (version ${VERSION})"

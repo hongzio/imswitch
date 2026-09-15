@@ -30,6 +30,8 @@ local state = {
   cooldown_until = 0,
 }
 
+local loopback = { ['127.0.0.1'] = true, ['::1'] = true, ['localhost'] = true }
+
 local function now_ms()
   return uv.hrtime() / 1e6
 end
@@ -51,8 +53,15 @@ local function resolve_endpoint()
   local override = vim.env.IMSWITCH_ADDR
   if override and override ~= '' then
     local host, port = override:match('^(.+):(%d+)$')
-    if host then return tcp(host, tonumber(port)) end
-    return pipe(override)
+    if host then
+      -- The override exists to reach an ssh -R tunnel, which always lands on
+      -- loopback. A non-loopback address would turn every ':' into an outbound
+      -- packet announcing that the user is at their editor, to whoever set the
+      -- variable — so ignore it and fall through to the defaults.
+      if loopback[host] then return tcp(host, tonumber(port)) end
+    else
+      return pipe(override)
+    end
   end
 
   local path = M.config.socket or (home() .. '/.local/state/imswitch/imswitch.sock')
@@ -73,12 +82,17 @@ local function send(endpoint, done)
   end
 
   local timer = uv.new_timer()
+  if not timer then
+    -- Without the watchdog a hung connect would strand this handle forever.
+    handle:close()
+    return done(false, 'no timer')
+  end
   local finished = false
 
   local function finish(ok, err)
     if finished then return end
     finished = true
-    if timer and not timer:is_closing() then
+    if not timer:is_closing() then
       timer:stop()
       timer:close()
     end
@@ -88,9 +102,7 @@ local function send(endpoint, done)
 
   -- connect() into a half-dead tunnel can hang indefinitely; handles must not
   -- pile up.
-  if timer then
-    timer:start(M.config.connect_timeout_ms, 0, function() finish(false, 'timeout') end)
-  end
+  timer:start(M.config.connect_timeout_ms, 0, function() finish(false, 'timeout') end)
 
   local function on_connect(err)
     -- The watchdog may have closed the handle already.
@@ -103,13 +115,20 @@ local function send(endpoint, done)
     end)
   end
 
-  local ok, err
+  local ok, result, connect_err
   if endpoint.kind == 'pipe' then
-    ok, err = pcall(handle.connect, handle, endpoint.path, on_connect)
+    ok, result, connect_err = pcall(handle.connect, handle, endpoint.path, on_connect)
   else
-    ok, err = pcall(handle.connect, handle, endpoint.host, endpoint.port, on_connect)
+    ok, result, connect_err = pcall(handle.connect, handle, endpoint.host, endpoint.port, on_connect)
   end
-  if not ok then finish(false, err) end
+  if not ok then
+    finish(false, result)
+  elseif result == nil then
+    -- luv reports some failures by returning nil, err rather than raising, and
+    -- then never calls on_connect. Without this the watchdog is the only thing
+    -- that notices, a full second later.
+    finish(false, connect_err)
+  end
 end
 
 local function record(ok)
