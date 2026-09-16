@@ -324,7 +324,7 @@ reaching you.
 
 ## Wiring left to do
 
-Two other repos are needed to make this installable; neither is touched here.
+The tap that makes this installable lives in another repo; it is not touched here.
 
 **`hongzio/homebrew-tap`** — one file, `Formula/imswitch.rb`. This was built and
 installed end to end against Homebrew 7.0.1 before being written down here:
@@ -381,22 +381,6 @@ Two things about the tap repo itself:
   name is what keeps `brew trust hongzio/tap` short.
 - **`brew trust` comes before `brew tap`**, otherwise tapping fails with
   "Cannot tap: invalid syntax in tap!" rather than anything about trust.
-
-**`hongzio/hongzio.github.io`** (dotfiles) — thin wiring only:
-
-- `nvim/lua/plugins/init.lua` — add `{ src = 'https://github.com/hongzio/imswitch' }`
-  to the `vim.pack.add` list and `require('plugins.imswitch')` to the load order.
-- `nvim/lua/plugins/imswitch.lua` (new) — `require('imswitch').setup({})`;
-  `nvim/lua/plugins/virgil.lua` is the model.
-- `init.sh` — one `check_step`/`mark_step` block: `brew trust hongzio/tap &&
-  brew tap hongzio/tap && brew install --HEAD imswitch && brew services start
-  imswitch`. Nothing is appended to `~/.ssh/config` any more; there is no ssh
-  config to keep idempotent.
-- `zsh/` — the `ssh()` wrapper from the Remote section, and whichever of
-  `docker`/`orb`/`tailcat` are worth the same treatment. On any box reached over
-  ssh, also the three tty-hint lines from the Multiplexers section; they are
-  what make a pane inside herdr or tmux work.
-- delete the empty `scripts/imswitch/` directory.
 
 ## License
 
