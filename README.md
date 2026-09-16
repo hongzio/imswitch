@@ -185,7 +185,7 @@ nowhere to live and is dropped. tmux admits this by gating forwarding behind
 `set -g allow-passthrough on`; herdr (0.9.0) has no equivalent setting and drops
 it outright.
 
-Going *under* the multiplexer rather than through it costs three lines in the
+Going *under* the multiplexer rather than through it costs a few lines in the
 remote box's shell rc. The session records its own tty on login and removes it
 on exit:
 
@@ -194,14 +194,17 @@ if [ -t 0 ] && [ -z "$TMUX" ] && [ -z "$HERDR_PANE_ID" ] && [ -z "$STY" ]; then
   d=${XDG_STATE_HOME:-$HOME/.local/state}/imswitch/tty.d
   f=$d/$(tty | tr / _)
   if mkdir -p "$d" && [ ! -e "$f" ]; then
-    tty > "$f" && trap 'rm -f "$f"' EXIT
+    tty > "$f" && trap "rm -f '$f'" EXIT
   fi
+  unset d f
 fi
 ```
 
-Four details in there are load-bearing:
+Five details in there are load-bearing:
 
-- **`-t 0`, not `-t 1`.** `tty(1)` reports the terminal on *standard input*.
+- **`-t 0`, not `-t 1`.** `tty(1)` reports the terminal on *standard input* —
+  which also makes the test only as good as the fd the rc file is handed. See
+  the placement note below.
 - **No `$SSH_TTY` test.** It fails from two directions, and both were measured
   here. It is an OpenSSH convention that other servers need not follow:
   tailcat's built-in SSH server allocates a pty perfectly well and leaves
@@ -221,6 +224,22 @@ Four details in there are load-bearing:
   away from the ones still running. Keyed by tty there is exactly one entry per
   terminal, the shell that created it owns the cleanup, and a stale entry left
   by a hard kill is *correct again* the moment that pts number is reused.
+- **The trap expands `$f` when it is set, not when it fires.** `f` is an
+  ordinary global, and an interactive shell is free to reuse the name — one
+  `for f in *` at the prompt and an exit-time expansion would `rm` whatever
+  that loop finished on while the real hint file leaks. Hence the double
+  quotes, and the `unset` that keeps `d` and `f` from leaking in the first
+  place.
+
+Placement matters as much as the test does. A prompt framework that paints
+something before the rc file has finished gets there by taking the terminal away
+first: the rest of the rc file runs with fd 0 on `/dev/null` and fd 1 on a
+scratch file, and the real descriptors return only once the first prompt is
+drawn. Below such a block `[ -t 0 ]` is false and `tty` answers `not a tty`, so
+these lines write nothing at all — no error, no file, and `:Imswitch` quietly
+counts one channel fewer. They belong at the top of the rc file, above anything
+that redirects the shell's own descriptors; that is also where frameworks of
+this kind ask initialization that touches the console to live.
 
 Non-interactive shells never reach this: a script, a `bash -c`, or an
 `ssh host command` does not source `.bashrc` (the stock one returns early, above
