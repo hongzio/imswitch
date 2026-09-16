@@ -55,7 +55,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc private func inputSourceChanged() {
         // Only matters while the menu is already open; menuWillOpen covers the
-        // rest. Rebuilding an open menu in place keeps the "현재:" line honest.
+        // rest. Rebuilding an open menu in place keeps the "Current:" line honest.
         guard menu.numberOfItems > 0, statusItem.button?.isHighlighted == true else { return }
         rebuild()
     }
@@ -70,21 +70,21 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.removeAllItems()
 
         let current = NSMenuItem(
-            title: "현재: \(InputSources.currentSourceName() ?? "알 수 없음")",
+            title: "Current: \(InputSources.currentSourceName() ?? "unknown")",
             action: nil, keyEquivalent: "")
         current.isEnabled = false
         menu.addItem(current)
 
         menu.addItem(.separator())
 
-        let header = NSMenuItem(title: "전환 대상", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "Switch target", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
 
         let target = Settings.targetInputSourceID
         let sources = InputSources.list()
         if sources.isEmpty {
-            let empty = NSMenuItem(title: "  (입력기를 찾을 수 없음)", action: nil, keyEquivalent: "")
+            let empty = NSMenuItem(title: "  (no input sources found)", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             menu.addItem(empty)
         }
@@ -102,24 +102,24 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
 
         let toggle = NSMenuItem(
-            title: "활성화", action: #selector(toggleEnabled(_:)), keyEquivalent: "")
+            title: "Enabled", action: #selector(toggleEnabled(_:)), keyEquivalent: "")
         toggle.target = self
         toggle.state = Settings.enabled ? .on : .off
         menu.addItem(toggle)
 
         let test = NSMenuItem(
-            title: "지금 전환 (테스트)", action: #selector(switchNow(_:)), keyEquivalent: "")
+            title: "Switch now (test)", action: #selector(switchNow(_:)), keyEquivalent: "")
         test.target = self
         menu.addItem(test)
 
-        let stamp = lastSwitchRequest.map { Self.clock.string(from: $0) } ?? "없음"
-        let last = NSMenuItem(title: "마지막 요청: \(stamp)", action: nil, keyEquivalent: "")
+        let stamp = lastSwitchRequest.map { Self.clock.string(from: $0) } ?? "none"
+        let last = NSMenuItem(title: "Last request: \(stamp)", action: nil, keyEquivalent: "")
         last.isEnabled = false
         menu.addItem(last)
 
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(title: "종료", action: #selector(quit(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit", action: #selector(quit(_:)), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
     }

@@ -272,23 +272,23 @@ unconditional `TISSelectInputSource` makes the IME visibly flicker.
 ## Menu bar
 
 ```
-현재: Han 2set
+Current: Han 2set
 ───────────────────────────
-전환 대상
+Switch target
   ✓ ABC
     Han 2set
 ───────────────────────────
-☑ 활성화
-지금 전환 (테스트)
-마지막 요청: 12:34:56
+☑ Enabled
+Switch now (test)
+Last request: 12:34:56
 ───────────────────────────
-종료
+Quit
 ```
 
 The menu is rebuilt every time it opens, so input sources added or removed
 since the last look show up immediately. Palettes (Emoji & Symbols, Press and
 Hold) are filtered out — they report as selectable but are not keyboards.
-"마지막 요청" is the cheapest way to tell whether a remote session is still
+"Last request" is the cheapest way to tell whether a remote session is still
 reaching you.
 
 ## Troubleshooting
