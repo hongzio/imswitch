@@ -33,11 +33,16 @@ server; `imswitch remote` is the pty proxy; every other verb is a small CLI
 client. The protocol is newline-delimited text and always answers, so `nc -U`
 is a complete client.
 
-Two kinds of channel reach the daemon, decided on every event. On the Mac, the
-unix socket. Anywhere else, an escape sequence written into the terminal stream,
-which `imswitch remote` pulls back out — to nvim's own terminal, and to the
-session's tty when a multiplexer would otherwise eat it. No tunnel, no listener,
-no port.
+Three channels reach the daemon, and every one of them that exists is used on
+every event: the unix socket, an escape sequence written into the terminal
+stream, and that same sequence written straight to the session's tty when a
+multiplexer would otherwise eat it. `imswitch remote` pulls the sequence back
+out. No tunnel, no listener, no port.
+
+All of them, rather than the likeliest one, because a socket that answers proves
+only that there is a daemon on this box — not that you are sitting at it. ssh
+from one Mac to another and both are true, pointing opposite ways. The Neovim
+section has the rest of that argument, and the option that narrows it.
 
 The plugin never reverts to Hangul — switching back is yours to do, the way you
 always have (F17). IMEs with sub-modes do not restore reliably, so imswitch
@@ -87,27 +92,42 @@ vim.pack.add({ { src = 'https://github.com/hongzio/imswitch' } })
 require('imswitch').setup({
   socket = '~/.local/state/imswitch/imswitch.sock',
   tty_hints = '~/.local/state/imswitch/tty.d',
+  channels = 'all', -- 'all' | 'socket' | 'sequence'
   throttle_ms = 150,
   connect_timeout_ms = 1000,
   events = { 'FocusGained', 'InsertLeave', 'CmdlineEnter' },
 })
 ```
 
-`:Imswitch` forces a request through and reports the channel it resolved. It is
+`:Imswitch` forces a request through and reports the channels it wrote to.
+`:Imswitch all|socket|sequence` changes them for the rest of the session. It is
 the only part of the plugin that ever talks to you.
 
 Behaviour worth knowing:
 
-- **The channels are decided per event, and nothing is cached.** The plugin
-  stats the socket; if it is there the daemon is local, so it writes to it. If
-  it is not, it writes the escape sequence to its own terminal *and* to every
-  session tty listed in the hint directory. Both are a few syscalls whether or
-  not anything is listening, so there is nothing to gain by working out which
-  applies — and nothing to lose when both arrive, because switching is
-  idempotent and the proxy collapses repeats inside 100 ms. A stat costs
-  microseconds, and deciding again every time is what lets a three-day-old nvim
-  inside tmux pick up an `imswitch remote` that only started this morning.
-  There is no endpoint cache, no failure count and no cooldown to go stale.
+- **Every channel that exists is written to on every event, and nothing is
+  cached.** The plugin stats the socket and scans the hint directory, then uses
+  what it found: the socket if there is a daemon on this box, the escape
+  sequence to its own terminal, and the sequence again to every session tty
+  listed in the hint directory. It does not try to work out which one applies,
+  because that cannot be worked out. A socket that answers means there is a
+  daemon here, not that you are in front of it — ssh from one Mac to another
+  and the socket answers at the far end while the keyboard is at yours, so
+  treating it as proof of locality switches the machine you are *not* looking
+  at. Nothing separates the two cases, so imswitch does not guess. Each channel
+  is a few syscalls whether or not anything is listening, switching is
+  idempotent, and the proxy collapses repeats inside 100 ms. Looking again
+  every time is also what lets a three-day-old nvim inside tmux pick up an
+  `imswitch remote` that only started this morning: no endpoint cache, no
+  failure count and no cooldown to go stale.
+- **`channels` narrows the fan-out, and `:Imswitch <mode>` does it without a
+  restart.** `all` is the default. `socket` is this box's daemon alone, and it
+  connects without stat'ing first — asked for one channel and one only, a
+  daemon that is not running has to fail loudly rather than quietly leak onto
+  another. `sequence` is the terminal and the session ttys, leaving this box's
+  daemon untouched; that is what a Mac you only ever reach over ssh wants in
+  its config, and `:Imswitch sequence` is how you say the same thing to an nvim
+  that has been open inside tmux since last week.
 - **Leading-edge throttle, not a trailing debounce.** Right after `:` the
   *next* keystroke already has to be ASCII, so the request goes out
   immediately and repeats inside the 150 ms window are dropped. Every request
@@ -172,7 +192,7 @@ Two costs, stated plainly:
   ssh() { command imswitch remote -- ssh "$@"; }
   ```
 
-  `:Imswitch` names the channel it resolved, so "why is this not working" is
+  `:Imswitch` names the channels it wrote to, so "why is this not working" is
   one command away.
 - **A multiplexer in between needs three lines of shell.** tmux, herdr and
   screen drop sequences they do not recognise. See the next section.
@@ -251,6 +271,11 @@ session's pty is a device file, and any process of the same user can open it.
 The bytes reach `imswitch remote` having never touched the grid, which is why
 this also removes the need for `allow-passthrough` under tmux.
 
+These lines belong on the boxes you reach *into*. Nothing breaks if they run on
+the Mac itself — the plugin then writes the sequence to your local session's tty
+too, where a real terminal ignores an APC it does not recognise — but it buys
+nothing there and adds one more write that can land mid-frame.
+
 A file rather than `$SSH_TTY`, because a pane inherits its environment from the
 multiplexer *server* — a daemon started by whichever session came first, so
 inside a pane that variable can be days stale. The directory is re-read on every
@@ -274,6 +299,11 @@ One consequence worth knowing: the sequence travels in your terminal stream, so
 anything already recording that stream — asciinema, a bastion's `script` log —
 gets a mark every time you press `:`. It leaks presence to something that is
 already recording you, and to nothing else.
+
+This holds on the Mac as well, where the socket alone would have done the job.
+The sequence still goes out, because whether it is needed is exactly what cannot
+be known from here. `channels = 'socket'` is how you say a machine is never
+reached over ssh.
 
 ## Commands
 
@@ -330,8 +360,15 @@ reaching you.
   yourself, not as a general habit.
 - **Nothing happens in a remote nvim.** Almost always the missing
   `imswitch remote --` prefix: without the proxy the sequence reaches your real
-  terminal, which ignores it. Run `:Imswitch` — it names the channel it
-  resolved.
+  terminal, which ignores it. Run `:Imswitch` — it names the channels it wrote
+  to.
+- **ssh'd into another Mac, and *that* Mac's input source is the one that
+  changes.** Both machines run a daemon, so the socket channel is live at the
+  far end too. The switch you wanted still arrives — it goes out over the
+  sequence in the same breath — so this is an extra switch rather than a
+  missing one. If touching the far Mac's IME is itself the problem, `:Imswitch
+  sequence` drops the socket for this session, and `channels = 'sequence'` in
+  that machine's config drops it for good.
 - **Nothing happens inside tmux, herdr or screen.** The multiplexer is eating
   the sequence. Add the three rc lines from the Remote section; under tmux,
   `set -g allow-passthrough on` also works. To tell them apart, run

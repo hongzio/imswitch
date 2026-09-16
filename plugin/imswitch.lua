@@ -15,6 +15,13 @@ vim.api.nvim_create_autocmd({ 'FocusGained', 'InsertLeave', 'CmdlineEnter' }, {
   end,
 })
 
-vim.api.nvim_create_user_command('Imswitch', function()
-  require('imswitch').command()
-end, { desc = 'imswitch: force a switch and report the channel it resolved' })
+-- Mirrors CHANNELS in lua/imswitch/init.lua. Completion has to answer without
+-- loading the module, for the same reason the event list above is duplicated;
+-- the module validates whatever actually arrives.
+vim.api.nvim_create_user_command('Imswitch', function(a)
+  require('imswitch').command(a.args)
+end, {
+  nargs = '?',
+  complete = function() return { 'all', 'socket', 'sequence' } end,
+  desc = 'imswitch: force a switch, or pick the channels to send it on',
+})

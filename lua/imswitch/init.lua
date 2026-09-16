@@ -1,15 +1,16 @@
 --- imswitch — force the macOS input source back to the configured target
 --- whenever Neovim moves into command input.
 ---
---- Three channels, and which ones apply is decided per event:
+--- Three channels, and by default every one of them that exists is written to
+--- on every event:
 ---
----   * the daemon's unix socket, when nvim runs on the Mac itself;
----   * an escape sequence written to nvim's own terminal, when it does not. It
----     rides the stream that is already there, back to an `imswitch remote --`
----     on the Mac, which strips it and asks the daemon. Nothing is tunnelled,
----     nothing listens, and nothing is installed at the far end — so a
----     container, a tailcat host and three ssh hops all work the same way, and
----     so does a `--network none` container with no shell worth speaking of;
+---   * the daemon's unix socket, when there is a daemon on this box;
+---   * an escape sequence written to nvim's own terminal. It rides the stream
+---     that is already there, back to an `imswitch remote --` on the Mac, which
+---     strips it and asks the daemon. Nothing is tunnelled, nothing listens,
+---     and nothing is installed at the far end — so a container, a tailcat host
+---     and three ssh hops all work the same way, and so does a `--network none`
+---     container with no shell worth speaking of;
 ---   * the same sequence written *directly to the session's tty*, for when a
 ---     multiplexer sits in between. tmux, herdr and screen are terminal
 ---     emulators: they parse a pane's bytes into a grid and re-render it, and a
@@ -19,9 +20,17 @@
 ---     there goes under the multiplexer rather than through it. See the README
 ---     for the three lines of shell that record the path.
 ---
---- Nothing is remembered between events. The channel is resolved from what is
---- true right now, which is what lets a three-day-old nvim inside tmux pick up
---- a proxy that only started this morning.
+--- Every one of them, because a reachable daemon is not evidence that the
+--- human is at this box's keyboard. ssh from one Mac to another and both are
+--- true at once: the socket answers here while the keyboard is at the far end.
+--- Nothing settles which, so imswitch does not guess — each channel costs a
+--- few syscalls whether or not anything is listening, the daemon's switch is
+--- idempotent, and the proxy collapses repeats inside 100 ms. `channels`
+--- narrows the fan-out when that is not what you want.
+---
+--- Nothing is remembered between events. What exists is looked up from scratch
+--- every time, which is what lets a three-day-old nvim inside tmux pick up a
+--- proxy that only started this morning.
 
 local uv = vim.uv or vim.loop
 
@@ -32,10 +41,18 @@ local M = {}
 M.config = {
   socket = nil, -- defaults to ~/.local/state/imswitch/imswitch.sock
   tty_hints = nil, -- defaults to ~/.local/state/imswitch/tty.d
+  channels = 'all', -- 'all' | 'socket' | 'sequence'
   throttle_ms = 150,
   connect_timeout_ms = 1000,
   events = { 'FocusGained', 'InsertLeave', 'CmdlineEnter' },
 }
+
+--- Which channels an event may use. `all` is every one that exists; `socket`
+--- is this box's daemon alone; `sequence` is the terminal and the session
+--- ttys, leaving this box's daemon untouched — what a Mac reached only over
+--- ssh wants. Mirrored as the completion list in plugin/imswitch.lua, which
+--- must answer without loading this module.
+local CHANNELS = { all = true, socket = true, sequence = true }
 
 local state = { last_send = 0 }
 
@@ -87,10 +104,11 @@ local function tty_hints()
   return paths
 end
 
+--- @param hints string[] hint files, as returned by tty_hints()
 --- @return integer how many session ttys accepted the write
-local function send_to_ttys()
+local function send_to_ttys(hints)
   local sent = 0
-  for _, hint in ipairs(tty_hints()) do
+  for _, hint in ipairs(hints) do
     local fd = uv.fs_open(hint, 'r', 384)
     if fd then
       local body = uv.fs_read(fd, 256, 0)
@@ -121,17 +139,37 @@ end
 --- Resolved on every event, not cached: the daemon may start after nvim did,
 --- and a proxy may appear or vanish under a long-lived session.
 local function resolve()
-  local path = socket_path()
-  local stat = uv.fs_stat(path)
-  if stat and stat.type == 'socket' then
-    return { kind = 'pipe', path = path, label = 'pipe ' .. path }
+  local mode = CHANNELS[M.config.channels] and M.config.channels or 'all'
+  local endpoint = { mode = mode }
+  local parts = {}
+
+  if mode ~= 'sequence' then
+    local path = socket_path()
+    local stat = uv.fs_stat(path)
+    -- An explicit `socket` skips the stat and connects regardless. Asked for
+    -- one channel and one only, a daemon that is not running has to surface as
+    -- a failed connect() rather than as silence.
+    if mode == 'socket' or (stat and stat.type == 'socket') then
+      endpoint.pipe = path
+      parts[#parts + 1] = 'pipe ' .. path
+    end
   end
 
-  local tmux = vim.env.TMUX ~= nil and vim.env.TMUX ~= ''
-  local hints = #tty_hints()
-  local label = tmux and 'terminal sequence (tmux-wrapped)' or 'terminal sequence'
-  if hints > 0 then label = label .. (' + %d session tty'):format(hints) end
-  return { kind = 'sequence', tmux = tmux, label = label }
+  if mode ~= 'socket' then
+    endpoint.sequence = true
+    endpoint.tmux = vim.env.TMUX ~= nil and vim.env.TMUX ~= ''
+    -- Scanned here and carried to the sender, so the directory is read once per
+    -- event rather than once for the label and once for the write.
+    endpoint.hints = tty_hints()
+    parts[#parts + 1] = endpoint.tmux and 'terminal sequence (tmux-wrapped)'
+      or 'terminal sequence'
+    if #endpoint.hints > 0 then
+      parts[#parts + 1] = ('%d session tty'):format(#endpoint.hints)
+    end
+  end
+
+  endpoint.label = ('%s: %s'):format(mode, table.concat(parts, ' + '))
+  return endpoint
 end
 
 --- One connection per event. The payload is a few bytes at human speed, and a
@@ -214,21 +252,25 @@ function M.fire(opts)
   state.last_send = t
 
   local endpoint = resolve()
-  if endpoint.kind == 'pipe' then
-    send_pipe(endpoint.path, function(ok, err)
+  -- Not exclusive. A socket that answers means there is a daemon on this box,
+  -- not that the human is in front of it — ssh from one Mac to another and both
+  -- are true at once. Each channel costs a few syscalls whether or not anything
+  -- is listening, so there is nothing to gain by picking one, and nothing to
+  -- lose when several arrive: the daemon's switch is idempotent and the proxy
+  -- collapses repeats inside 100 ms.
+  if endpoint.sequence then
+    send_to_ttys(endpoint.hints)
+    send_sequence(endpoint.tmux)
+  end
+  if endpoint.pipe then
+    send_pipe(endpoint.pipe, function(ok, err)
       if opts.on_result then opts.on_result(ok, err, endpoint) end
     end)
-  else
-    -- Both, unconditionally. Each costs a few syscalls whether or not anything
-    -- is listening, so there is nothing to gain by working out which one
-    -- applies — and nothing to lose if both arrive, because the daemon's switch
-    -- is idempotent and the proxy collapses repeats inside 100 ms.
-    send_to_ttys()
-    send_sequence(endpoint.tmux)
-    -- Fire and forget: the bytes leave through a one-way channel and whether
+  elseif opts.on_result then
+    -- Fire and forget: the bytes left through a one-way channel and whether
     -- anything is listening upstream is not knowable from here, which is the
     -- same silence the socket path keeps when no daemon is running.
-    if opts.on_result then opts.on_result(true, nil, endpoint) end
+    opts.on_result(true, nil, endpoint)
   end
   return true
 end
@@ -262,22 +304,48 @@ function M.wire()
 end
 
 function M.status()
-  return { endpoint = resolve().label }
+  local endpoint = resolve()
+  return { channels = endpoint.mode, endpoint = endpoint.label }
 end
 
---- :Imswitch — the debugging escape hatch. Forces a request through and reports
---- the channel it resolved. The only place in the plugin allowed to talk to the
---- user.
-function M.command()
+--- :Imswitch — the debugging escape hatch, and the only place in the plugin
+--- allowed to talk to the user. With no argument it forces a request through
+--- and reports the channels it wrote to. With one it changes them first, for
+--- the rest of this session: an nvim that has been open inside tmux for days
+--- is exactly where the fan-out needs narrowing, and restarting it to edit a
+--- config file is not an answer.
+--- @param mode string|nil one of CHANNELS, or nil/'' to leave it alone
+function M.command(mode)
+  if mode and mode ~= '' then
+    if not CHANNELS[mode] then
+      local names = vim.tbl_keys(CHANNELS)
+      table.sort(names)
+      return vim.notify(
+        ('imswitch: unknown channels %q (want %s)')
+          :format(mode, table.concat(names, ', ')),
+        vim.log.levels.WARN)
+    end
+    -- The setting *is* the current policy. One place to write, one to read.
+    M.config.channels = mode
+  end
+
   M.fire({
     force = true,
     on_result = function(ok, err, endpoint)
       vim.schedule(function()
-        local outcome = ok and 'sent' or ('failed: ' .. tostring(err))
-        if ok and endpoint.kind == 'sequence' then
+        local outcome
+        if not endpoint.sequence then
+          outcome = ok and 'sent' or ('failed: ' .. tostring(err))
+        elseif not endpoint.pipe then
           -- Worth saying plainly: a sequence with no `imswitch remote --`
           -- upstream is indistinguishable from one that arrived.
           outcome = 'sent (no reply on this channel)'
+        elseif ok then
+          outcome = 'sent'
+        else
+          -- The sequence still went out, so this is a warning about one channel
+          -- rather than a failed request.
+          outcome = 'sent on sequence; socket failed: ' .. tostring(err)
         end
         vim.notify(('imswitch: %s -> %s'):format(endpoint.label, outcome),
           ok and vim.log.levels.INFO or vim.log.levels.WARN)
@@ -290,6 +358,13 @@ end
 --- override them.
 function M.setup(opts)
   M.config = vim.tbl_extend('force', M.config, opts or {})
+  if not CHANNELS[M.config.channels] then
+    -- resolve() falls back on its own, but doing it silently would leave a typo
+    -- here looking like a broken plugin later.
+    vim.notify(('imswitch: unknown channels %q, using "all"')
+      :format(tostring(M.config.channels)), vim.log.levels.WARN)
+    M.config.channels = 'all'
+  end
   M.wire()
 end
 
