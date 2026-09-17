@@ -27,7 +27,7 @@ enum Remote {
         // channel is simply absent, which is what every other imswitch path
         // does when it has nothing to talk to.
         guard isatty(STDIN_FILENO) == 1, isatty(STDOUT_FILENO) == 1 else {
-            exit(spawnAndWait(command, fileActions: nil, attributes: nil))
+            exit(spawnAndWait(command))
         }
 
         let master = posix_openpt(O_RDWR | O_NOCTTY)
@@ -42,7 +42,7 @@ enum Remote {
         // after the child exits and the read loop would never see EOF.
         _ = fcntl(master, F_SETFD, FD_CLOEXEC)
 
-        // Hold the slave open across the spawn. Two reasons, and the first is
+        // Hold the slave open across the fork. Two reasons, and the first is
         // not obvious: on macOS TIOCSWINSZ against the master fails with -1
         // until some process has opened the slave, so the size below would be
         // silently dropped and the child would start at 0x0 — full-screen
@@ -57,33 +57,16 @@ enum Remote {
             _ = ioctl(master, UInt(TIOCSWINSZ), &size)
         }
 
-        var actions: posix_spawn_file_actions_t?
-        posix_spawn_file_actions_init(&actions)
-        defer { posix_spawn_file_actions_destroy(&actions) }
-        // Opening the slave *by path* in the child is what acquires the
-        // controlling terminal: POSIX_SPAWN_SETSID has already made the child a
-        // session leader by this point, and a session leader that opens a
-        // terminal without O_NOCTTY takes it as its ctty. A dup2 of an
-        // inherited fd would not — the child would have a tty on its fds but no
-        // ctty, and ^C, ^Z and /dev/tty would all be dead.
-        posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, slavePath, O_RDWR, 0)
-        posix_spawn_file_actions_adddup2(&actions, STDIN_FILENO, STDOUT_FILENO)
-        posix_spawn_file_actions_adddup2(&actions, STDIN_FILENO, STDERR_FILENO)
-
-        var attributes: posix_spawnattr_t?
-        posix_spawnattr_init(&attributes)
-        defer { posix_spawnattr_destroy(&attributes) }
-        posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSID))
-
         var pid: pid_t = 0
-        let spawned = spawn(command, &pid, &actions, &attributes)
+        let failure = startChild(
+            command, slavePath: slavePath, master: master, slave: slave, pid: &pid)
         // The second reason: a slave fd left open here would keep the pty alive
         // after the child exits, and the read loop would wait for an EOF that
         // never comes.
         if slave >= 0 { close(slave) }
-        guard spawned == 0 else {
+        if let failure {
             // Still safe to talk: raw mode is not on yet.
-            let why = String(cString: strerror(spawned))
+            let why = String(cString: strerror(failure))
             FileHandle.standardError.write(Data("imswitch: cannot run \(program): \(why)\n".utf8))
             exit(127)
         }
@@ -224,27 +207,131 @@ enum Remote {
 
     // MARK: - Process helpers
 
-    private static func spawn(
-        _ command: [String], _ pid: inout pid_t,
-        _ actions: UnsafeMutablePointer<posix_spawn_file_actions_t?>?,
-        _ attributes: UnsafeMutablePointer<posix_spawnattr_t?>?
-    ) -> Int32 {
+    /// Starts the command in the pty, with the pty as its controlling terminal.
+    /// Returns nil once it is running, or the errno that stopped it.
+    ///
+    /// fork rather than posix_spawn, and the reason is an ordering detail worth
+    /// writing down. A session leader that opens a terminal without O_NOCTTY
+    /// takes it as its controlling terminal, so the obvious spawn is
+    /// POSIX_SPAWN_SETSID plus a file action that opens the slave by path. On
+    /// macOS the file actions run during image activation and SETSID is applied
+    /// after them, so at the moment of that open the child is still in this
+    /// process's session and acquires nothing. What comes out is a session
+    /// leader with no controlling terminal: /dev/tty is ENXIO, tcgetpgrp is
+    /// ENOTTY, the pty has no foreground process group — and so TIOCSWINSZ on
+    /// the master signals nobody, which is a window resize that never reaches
+    /// ssh. Doing setsid and the open by hand is the only way to order them.
+    ///
+    /// Everything between the fork and the exec runs in a forked child of a
+    /// process with Cocoa and Carbon loaded. Only async-signal-safe calls
+    /// belong there: no Swift String, no allocation, nothing that logs. The
+    /// argv array is built before the fork for that reason.
+    private static func startChild(
+        _ command: [String], slavePath: String, master: Int32, slave: Int32, pid: inout pid_t
+    ) -> Int32? {
+        // Carries the exec's errno back. FD_CLOEXEC on the write end means a
+        // successful exec closes it and the parent's read ends in EOF: silence
+        // is how the child says it is running.
+        var report: [Int32] = [-1, -1]
+        let reporting = pipe(&report) == 0
+        if reporting { _ = fcntl(report[1], F_SETFD, FD_CLOEXEC) }
+
+        var child: pid_t = -1
+        let forkFailure: Int32? = slavePath.withCString { path in
+            withArgv(command) { argv in
+                child = imswitch_fork()
+                if child == 0 {
+                    // ---- async-signal-safe only, until execvp ----
+                    setsid()
+                    let tty = open(path, O_RDWR)
+                    if tty >= 0 {
+                        _ = ioctl(tty, UInt(TIOCSCTTY), 0)
+                        _ = dup2(tty, STDIN_FILENO)
+                        _ = dup2(tty, STDOUT_FILENO)
+                        _ = dup2(tty, STDERR_FILENO)
+                        if tty > STDERR_FILENO { close(tty) }
+                    }
+                    if slave >= 0 { close(slave) }
+                    close(master)
+                    if reporting { close(report[0]) }
+                    // main.swift ignores SIGPIPE so that a client hanging up
+                    // cannot kill the daemon. An ignored disposition survives
+                    // exec and shells pass it on rather than reset it, so
+                    // leaving it here plants it in everything the user runs.
+                    signal(SIGPIPE, SIG_DFL)
+                    // execvp, not execv: the command is whatever the user types
+                    // at a shell prompt — `docker`, `orb`, `tailcat` — and it
+                    // has to be found on PATH the same way.
+                    execvp(argv[0], argv)
+                    var why = errno
+                    if reporting { _ = write(report[1], &why, MemoryLayout<Int32>.size) }
+                    _exit(127)
+                }
+                return child < 0 ? errno : nil
+            }
+        }
+
+        // The parent's copy of the write end has to go before the read below,
+        // or the EOF that means success can never arrive.
+        if reporting { close(report[1]) }
+        if let forkFailure {
+            if reporting { close(report[0]) }
+            return forkFailure
+        }
+        pid = child
+        guard reporting else { return nil }
+
+        var why: Int32 = 0
+        let width = MemoryLayout<Int32>.size
+        var filled = 0
+        // Blocking is safe: between the fork and the exec the child only makes
+        // system calls, so it cannot wedge with the pipe still open.
+        withUnsafeMutableBytes(of: &why) { raw in
+            while filled < width {
+                let n = read(report[0], raw.baseAddress!.advanced(by: filled), width - filled)
+                if n > 0 { filled += n; continue }
+                if n < 0 && errno == EINTR { continue }
+                break
+            }
+        }
+        close(report[0])
+        guard filled == width else { return nil }
+
+        // It never reached exec, so nothing else will ever reap it.
+        var status: Int32 = 0
+        while waitpid(child, &status, 0) < 0 && errno == EINTR {}
+        return why
+    }
+
+    /// A strdup'd argv, built and freed on this side of the fork: allocating in
+    /// a forked child is not safe, and execvp wants the array ready to use.
+    private static func withArgv<T>(
+        _ command: [String], _ body: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> T
+    ) -> T {
         var argv: [UnsafeMutablePointer<CChar>?] = command.map { strdup($0) }
         argv.append(nil)
         defer { for pointer in argv where pointer != nil { free(pointer) } }
-        // posix_spawnp, not posix_spawn: the command is whatever the user types
-        // at a shell prompt — `docker`, `orb`, `tailcat` — and it has to be
-        // found on PATH the same way.
-        return posix_spawnp(&pid, command[0], actions, attributes, &argv, environ)
+        return argv.withUnsafeMutableBufferPointer { body($0.baseAddress!) }
     }
 
-    private static func spawnAndWait(
-        _ command: [String],
-        fileActions: UnsafeMutablePointer<posix_spawn_file_actions_t?>?,
-        attributes: UnsafeMutablePointer<posix_spawnattr_t?>?
-    ) -> Int32 {
+    /// The no-terminal path: nothing to proxy, so no pty to hand over either,
+    /// and posix_spawn says all of that in one call.
+    private static func spawnAndWait(_ command: [String]) -> Int32 {
+        var attributes: posix_spawnattr_t?
+        posix_spawnattr_init(&attributes)
+        defer { posix_spawnattr_destroy(&attributes) }
+        // Same reason as the fork path: main.swift's ignored SIGPIPE must not
+        // become the command's. posix_spawn inherits it too without this.
+        var defaulted = sigset_t()
+        sigemptyset(&defaulted)
+        sigaddset(&defaulted, SIGPIPE)
+        posix_spawnattr_setsigdefault(&attributes, &defaulted)
+        posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETSIGDEF))
+
         var pid: pid_t = 0
-        let spawned = spawn(command, &pid, fileActions, attributes)
+        let spawned = withArgv(command) { argv in
+            posix_spawnp(&pid, command[0], nil, &attributes, argv, environ)
+        }
         guard spawned == 0 else {
             let why = String(cString: strerror(spawned))
             FileHandle.standardError.write(Data("imswitch: cannot run \(command[0]): \(why)\n".utf8))

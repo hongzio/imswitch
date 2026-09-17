@@ -25,6 +25,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # @convention(c) closure reading a global, which strict concurrency rejects.
 swiftc -O -sdk "$SDK" \
 	-framework Cocoa -framework Carbon \
+	-import-objc-header Sources/shim.h \
 	-o "$APP/Contents/MacOS/imswitch" \
 	Sources/*.swift
 
