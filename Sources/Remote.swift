@@ -18,7 +18,7 @@ import Foundation
 enum Remote {
     static func run(_ command: [String]) -> Never {
         guard let program = command.first else {
-            FileHandle.standardError.write(Data("imswitch: remote needs a command to run\n".utf8))
+            warn("imswitch: remote needs a command to run\n")
             exit(2)
         }
 
@@ -30,11 +30,26 @@ enum Remote {
             exit(spawnAndWait(command))
         }
 
+        // posix_openpt takes the lowest free descriptor. With stderr closed
+        // that descriptor is 2, and from then on everything this process calls
+        // stderr is really the pty master: the diagnostics below would be
+        // written into the terminal they are trying to report about, and the
+        // child would lose its own stderr when it closes the master. Only fd 2
+        // can be free at this point — the guard above proved 0 and 1 are
+        // terminals — and only on this path, where a pty is about to exist.
+        if fcntl(STDERR_FILENO, F_GETFD) == -1 && errno == EBADF {
+            let null = open("/dev/null", O_RDWR)
+            if null >= 0 && null != STDERR_FILENO {
+                _ = dup2(null, STDERR_FILENO)
+                close(null)
+            }
+        }
+
         let master = posix_openpt(O_RDWR | O_NOCTTY)
         guard master >= 0, grantpt(master) == 0, unlockpt(master) == 0,
             let name = ptsname(master)
         else {
-            FileHandle.standardError.write(Data("imswitch: cannot allocate a pty\n".utf8))
+            warn("imswitch: cannot allocate a pty\n")
             exit(1)
         }
         let slavePath = String(cString: name)
@@ -67,7 +82,7 @@ enum Remote {
         if let failure {
             // Still safe to talk: raw mode is not on yet.
             let why = String(cString: strerror(failure))
-            FileHandle.standardError.write(Data("imswitch: cannot run \(program): \(why)\n".utf8))
+            warn("imswitch: cannot run \(program): \(why)\n")
             exit(127)
         }
 
@@ -334,7 +349,7 @@ enum Remote {
         }
         guard spawned == 0 else {
             let why = String(cString: strerror(spawned))
-            FileHandle.standardError.write(Data("imswitch: cannot run \(command[0]): \(why)\n".utf8))
+            warn("imswitch: cannot run \(command[0]): \(why)\n")
             return 127
         }
         var status: Int32 = 0
@@ -346,6 +361,14 @@ enum Remote {
     private static func exitCode(from status: Int32) -> Int32 {
         if status & 0x7f == 0 { return (status >> 8) & 0xff }
         return 128 &+ (status & 0x7f)
+    }
+
+    /// stderr without Foundation. FileHandle.write raises on a failed write --
+    /// a closed descriptor, or the EPIPE that main.swift's ignored SIGPIPE
+    /// leaves behind when a reader goes away -- and an uncaught raise aborts
+    /// the process. The worst a lost diagnostic deserves is being lost.
+    private static func warn(_ message: String) {
+        writeAll(STDERR_FILENO, Array(message.utf8))
     }
 
     @discardableResult
